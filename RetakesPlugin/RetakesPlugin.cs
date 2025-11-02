@@ -18,13 +18,14 @@ using RetakesPlugin.Commands.Admin;
 using RetakesPlugin.Commands.MapConfig;
 using RetakesPlugin.Commands.Player;
 using RetakesPlugin.Commands.SpawnEditor;
+using RetakesPlugin.Commands.BarrierEditor;
 
 namespace RetakesPlugin;
 
 [MinimumApiVersion(345)]
 public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
 {
-    public const string Version = "2.2.0";
+    public const string Version = "2.3.0";
 
     #region Plugin Info
     public override string ModuleName => "Retakes Plugin";
@@ -50,7 +51,9 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
     private GameManager? _gameManager;
     private SpawnManager? _spawnManager;
     private BreakerManager? _breakerManager;
+    private BarrierManager? _barrierManager;
     private MapConfigService? _mapConfigService;
+    private BarrierConfigService? _barrierConfigService;
     private AllocationService? _allocationService;
     private AnnouncementService? _announcementService;
     private RoundEventHandlers? _roundEventHandlers;
@@ -77,6 +80,9 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
     private RemoveSpawnCommand? _removeSpawnCommand;
     private NearestSpawnCommand? _nearestSpawnCommand;
     private HideSpawnsCommand? _hideSpawnsCommand;
+
+    // Barrier Editor
+    private BarrierEditorCommands? _barrierEditorCommands;
     #endregion
 
     #region Capabilities
@@ -123,6 +129,7 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
         RegisterEventHandler<EventBombDefused>(OnBombDefused);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect, HookMode.Pre);
         RegisterEventHandler<EventPlayerTeam>(OnPlayerTeam, HookMode.Pre);
+        RegisterEventHandler<EventPlayerPing>(OnPlayerPing);
 
         if (hotReload)
         {
@@ -180,6 +187,15 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
                 Config.Game.ShouldOpenDoors
             );
 
+            // Initialize BarrierConfigService and BarrierManager
+            if (Config.Barrier.IsBarrierEnabled)
+            {
+                _barrierConfigService = new BarrierConfigService(ModuleDirectory, customMapConfig ?? mapName, _jsonOptions);
+                _barrierConfigService.Load();
+                _barrierManager = new BarrierManager(_barrierConfigService);
+                Utils.Logger.LogInfo("Services", "Barrier system initialized");
+            }
+
             _announcementService = new AnnouncementService(
                 this,
                 _random,
@@ -194,11 +210,14 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
                 _gameManager,
                 _spawnManager,
                 _breakerManager,
+                _barrierManager,
                 _allocationService,
                 _announcementService,
                 Config.Bomb.IsAutoPlantEnabled,
                 Config.Game.EnableFallbackAllocation,
                 Config.MapConfig.EnableFallbackBombsiteAnnouncement,
+                Config.Barrier.IsBarrierEnabled,
+                Config.Barrier.BarrierRemoveDelay,
                 _random,
                 _mapConfigService
             );
@@ -224,6 +243,12 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
             _removeSpawnCommand = new RemoveSpawnCommand(this, _mapConfigService, _spawnManager, _showSpawnsCommand);
             _nearestSpawnCommand = new NearestSpawnCommand(this, _spawnManager, _showSpawnsCommand);
             _hideSpawnsCommand = new HideSpawnsCommand(this, _showSpawnsCommand);
+
+            // Initialize Barrier Commands
+            if (Config.Barrier.IsBarrierEnabled && _barrierConfigService != null && _barrierManager != null)
+            {
+                _barrierEditorCommands = new BarrierEditorCommands(this, _barrierConfigService, _barrierManager);
+            }
 
             // Register all commands
             RegisterCommands();
@@ -277,6 +302,23 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
         AddCommand("css_done", "Exits the spawn editing mode.", _hideSpawnsCommand.OnCommand);
         AddCommand("css_exitedit", "Exits the spawn editing mode.", _hideSpawnsCommand.OnCommand);
 
+        // Barrier Editor Commands
+        if (_barrierEditorCommands != null)
+        {
+            AddCommand("css_editbarriers", "Enter barrier editing mode for a bombsite.", _barrierEditorCommands.OnCommandEditBarriers);
+            AddCommand("css_barriers", "Enter barrier editing mode for a bombsite.", _barrierEditorCommands.OnCommandEditBarriers);
+            AddCommand("css_showbarriers", "Show barriers for a bombsite.", _barrierEditorCommands.OnCommandShowBarriers);
+            AddCommand("css_viewbarriers", "Show barriers for a bombsite.", _barrierEditorCommands.OnCommandShowBarriers);
+            AddCommand("css_hidebarriers", "Exit barrier viewing mode.", _barrierEditorCommands.OnCommandHideBarriers);
+            AddCommand("css_removebarrier", "Remove the nearest barrier.", _barrierEditorCommands.OnCommandRemoveBarrier);
+            AddCommand("css_deletebarrier", "Remove the nearest barrier.", _barrierEditorCommands.OnCommandRemoveBarrier);
+            AddCommand("css_testbarrier", "Test current barriers for the bombsite.", _barrierEditorCommands.OnCommandTestBarrier);
+            AddCommand("css_donebarriers", "Exit barrier editing mode.", _barrierEditorCommands.OnCommandDoneBarriers);
+            AddCommand("css_exitbarriers", "Exit barrier editing mode.", _barrierEditorCommands.OnCommandDoneBarriers);
+
+            Utils.Logger.LogInfo("Commands", "Barrier commands registered successfully");
+        }
+
         // Player Commands
         AddCommand("css_voices", "Toggles whether or not you want to hear bombsite voice announcements.", _voicesCommand.OnCommand);
 
@@ -297,16 +339,32 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
 
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        if (_barrierEditorCommands?.IsEditingMode ?? false)
+        {
+            Utils.Logger.LogDebug("Round", "Barrier editing mode active, skipping round logic");
+            return HookResult.Continue;
+        }
+
         return _roundEventHandlers?.OnRoundStart(@event, info) ?? HookResult.Continue;
     }
 
     private HookResult OnRoundPostStart(EventRoundPoststart @event, GameEventInfo info)
     {
+        if (_barrierEditorCommands?.IsEditingMode ?? false)
+        {
+            return HookResult.Continue;
+        }
+
         return _roundEventHandlers?.OnRoundPostStart(@event, info) ?? HookResult.Continue;
     }
 
     private HookResult OnRoundFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
     {
+        if (_barrierEditorCommands?.IsEditingMode ?? false)
+        {
+            return HookResult.Continue;
+        }
+
         return _roundEventHandlers?.OnRoundFreezeEnd(@event, info) ?? HookResult.Continue;
     }
 
@@ -343,6 +401,11 @@ public class RetakesPlugin : BasePlugin, IPluginConfig<BaseConfigs>
     private HookResult OnPlayerTeam(EventPlayerTeam @event, GameEventInfo info)
     {
         return _playerEventHandlers?.OnPlayerTeam(@event, info) ?? HookResult.Continue;
+    }
+
+    private HookResult OnPlayerPing(EventPlayerPing @event, GameEventInfo info)
+    {
+        return _barrierEditorCommands?.OnPlayerPing(@event, info) ?? HookResult.Continue;
     }
     #endregion
 
